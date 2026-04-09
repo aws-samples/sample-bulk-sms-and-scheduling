@@ -31,11 +31,15 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+
+# E.164 phone number format: + followed by 1-15 digits
+E164_PATTERN = re.compile(r"^\+[1-9]\d{1,14}$")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -55,8 +59,12 @@ def handler(event, context):
     logger.info("Event received: %s", json.dumps(event, default=str))
 
     for record in event.get("Records", []):
-        bucket = record["s3"]["bucket"]["name"]
-        key = record["s3"]["object"]["key"]
+        try:
+            bucket = record["s3"]["bucket"]["name"]
+            key = record["s3"]["object"]["key"]
+        except (KeyError, TypeError) as e:
+            logger.error("Malformed S3 event record, skipping: %s", e)
+            continue
 
         # Safety check — only process files in incoming/
         if not key.startswith("incoming/"):
@@ -74,7 +82,12 @@ def handler(event, context):
 
 def process_csv(bucket: str, key: str) -> dict:
     """Download and parse the CSV, send SMS for each row."""
-    response = s3.get_object(Bucket=bucket, Key=key)
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        logger.error("Failed to read s3://%s/%s: %s", bucket, key, e)
+        return {"total": 0, "sent": 0, "failed": 0, "errors": [f"S3 GetObject failed: {e}"]}
+
     body = response["Body"].read().decode("utf-8")
     reader = csv.DictReader(io.StringIO(body))
 
@@ -101,6 +114,12 @@ def process_csv(bucket: str, key: str) -> dict:
             results["failed"] += 1
             results["errors"].append(f"Row {results['total']}: empty phone number")
             results["log_lines"].append(f"Row {results['total']} | SKIP | (empty) | empty phone number")
+            continue
+
+        if not E164_PATTERN.match(phone):
+            results["failed"] += 1
+            results["errors"].append(f"Row {results['total']}: invalid E.164 format: {phone}")
+            results["log_lines"].append(f"Row {results['total']} | SKIP | {phone} | invalid E.164 format")
             continue
 
         if not message:

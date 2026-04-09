@@ -84,25 +84,65 @@ Set `DEFAULT_MESSAGE` to: `Hi {{name}}, your appointment is on {{appt_date}}.`
 
 | Permission | Resource | Purpose |
 |---|---|---|
-| `s3:GetObject` | `bucket/incoming/*` | Read uploaded CSV |
-| `s3:PutObject` | `bucket/processed/*`, `bucket/logs/*` | Move files, write logs |
-| `s3:DeleteObject` | `bucket/incoming/*` | Remove from incoming after move |
-| `sms-voice:SendTextMessage` | `*` | Send SMS |
+| `s3:GetObject` | `arn:aws:s3:::YOUR-BUCKET/incoming/*` | Read uploaded CSV |
+| `s3:PutObject` | `arn:aws:s3:::YOUR-BUCKET/processed/*`, `arn:aws:s3:::YOUR-BUCKET/logs/*` | Move files, write logs |
+| `s3:DeleteObject` | `arn:aws:s3:::YOUR-BUCKET/incoming/*` | Remove from incoming after move |
+| `sms-voice:SendTextMessage` | `arn:aws:us-east-1:123456789012:phone-number/phone-abcdef1234567890abcdef1234567890` | Send SMS via a specific origination identity |
+
+Scope `sms-voice:SendTextMessage` to your specific origination identity ARN. Add a condition key to further restrict by origination identity:
+
+```json
+{
+    "Effect": "Allow",
+    "Action": "sms-voice:SendTextMessage",
+    "Resource": "arn:aws:sms-voice:us-east-1:123456789012:phone-number/phone-abcdef1234567890abcdef1234567890",
+    "Condition": {
+        "StringEquals": {
+            "sms-voice:OriginationIdentity": "+15551234567"
+        }
+    }
+}
+```
 
 ## Scheduling Options
 
 See the [full documentation](documentation/user-guides/bulk-sms-and-scheduling-setup-guide.md) for detailed scheduling options:
 
 1. **Amazon EventBridge Scheduler** (recommended) — Simple, low-cost, native time zone support
-2. **DynamoDB Scheduling Table** — Campaign management with cancel/reschedule capability
+2. **Amazon DynamoDB Scheduling Table** — Campaign management with cancel/reschedule capability
 3. **AWS Step Functions** — Complex workflows with approval steps and visual designer
 
 ## Security
 
-- Scope S3 permissions to specific bucket ARNs
-- Use least-privilege IAM roles
-- Filter opt-out numbers before uploading
-- Include opt-out instructions in message content
+### S3 Bucket Security
+
+- Enable Block Public Access on the S3 bucket
+- Enable default encryption (SSE-S3 or SSE-KMS) for encryption at rest
+- Add a bucket policy to enforce HTTPS-only access (deny `aws:SecureTransport = false`)
+- Enable S3 server access logging or AWS CloudTrail data events
+- Enable versioning to protect against accidental deletes
+- Consider enabling MFA Delete for production buckets
+
+### IAM and Access Control
+
+- Scope all S3 permissions to the specific bucket ARN
+- Scope `sms-voice:SendTextMessage` to your origination identity ARN with a condition key (see IAM section above)
+- Use least-privilege IAM roles — grant only the permissions listed in the IAM table
+- Review IAM policies periodically and remove unused permissions
+
+### Data Protection
+
+- Phone numbers and message content are PII — treat them accordingly
+- Enable encryption at rest on S3 (SSE-S3 or SSE-KMS) and Lambda environment variables (KMS)
+- All AWS SDK calls use HTTPS (TLS) by default for encryption in transit
+- Enforce HTTPS-only access to S3 via bucket policy
+- Consider using AWS KMS customer managed keys for sensitive workloads and rotate keys annually
+
+### Opt-Out Compliance
+
+- AWS End User Messaging automatically handles STOP/HELP keyword responses at the carrier level
+- Filter opt-out numbers before uploading your CSV
+- Include opt-out instructions in message content where required by regulation
 
 ## License
 

@@ -88,6 +88,71 @@ Create an S3 bucket to receive your CSV uploads. We recommend creating three pre
 
 This keeps your bucket organized and prevents reprocessing.
 
+**Required security configuration:**
+
+1. **Block Public Access** — Enable all four Block Public Access settings on the bucket:
+
+```bash
+aws s3api put-public-access-block \
+    --bucket YOUR-BUCKET \
+    --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+```
+
+2. **Encryption at rest** — Enable default SSE-S3 encryption (or SSE-KMS for stricter key management):
+
+```bash
+aws s3api put-bucket-encryption \
+    --bucket YOUR-BUCKET \
+    --server-side-encryption-configuration '{
+        "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}, "BucketKeyEnabled": true}]
+    }'
+```
+
+3. **Enforce HTTPS** — Add a bucket policy that denies non-TLS requests:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Sid": "DenyInsecureTransport",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [
+            "arn:aws:s3:::YOUR-BUCKET",
+            "arn:aws:s3:::YOUR-BUCKET/*"
+        ],
+        "Condition": {
+            "Bool": {"aws:SecureTransport": "false"}
+        }
+    }]
+}
+```
+
+4. **Enable versioning** — Protects against accidental overwrites and deletes:
+
+```bash
+aws s3api put-bucket-versioning \
+    --bucket YOUR-BUCKET \
+    --versioning-configuration Status=Enabled
+```
+
+5. **Enable server access logging** — Logs all requests to the bucket for audit purposes:
+
+```bash
+aws s3api put-bucket-logging \
+    --bucket YOUR-BUCKET \
+    --bucket-logging-status '{
+        "LoggingEnabled": {
+            "TargetBucket": "YOUR-LOG-BUCKET",
+            "TargetPrefix": "s3-access-logs/bulk-sms/"
+        }
+    }'
+```
+
+6. **(Optional) Enable MFA Delete** — For production buckets handling sensitive data, consider enabling MFA Delete to require multi-factor authentication for object deletion. This must be configured by the root account.
+
 ### Step 2: Create the Lambda Function
 
 A reference implementation is provided at `lambda/bulk_sms_sender/app.py`. You can deploy this directly or use it as a starting point.
@@ -165,12 +230,77 @@ Your Lambda execution role needs the following permissions:
 | `s3:GetObject` | Your S3 bucket/incoming/* | Read the uploaded CSV |
 | `s3:PutObject` | Your S3 bucket/processed/* and logs/* | Move processed files and write log files |
 | `s3:DeleteObject` | Your S3 bucket/incoming/* | Remove file from incoming after move |
-| `sms-voice:SendTextMessage` | * | Send SMS via End User Messaging |
+| `sms-voice:SendTextMessage` | `arn:aws:sms-voice:us-east-1:123456789012:phone-number/phone-abcdef1234567890abcdef1234567890` | Send SMS via a specific origination identity |
 | `logs:CreateLogGroup` | Lambda log group | CloudWatch logging |
 | `logs:CreateLogStream` | Lambda log group | CloudWatch logging |
 | `logs:PutLogEvents` | Lambda log group | CloudWatch logging |
 
-**Security best practice:** Scope the S3 permissions to only the specific bucket ARN, and consider adding a condition key to restrict `SendTextMessage` to your specific origination identity if you have multiple.
+**Security implementation:** Scope the S3 permissions to only the specific bucket ARN. Scope `sms-voice:SendTextMessage` to your origination identity ARN and add a condition key:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::YOUR-BUCKET/incoming/*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": [
+                "arn:aws:s3:::YOUR-BUCKET/processed/*",
+                "arn:aws:s3:::YOUR-BUCKET/logs/*"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Action": "s3:DeleteObject",
+            "Resource": "arn:aws:s3:::YOUR-BUCKET/incoming/*"
+        },
+        {
+            "Effect": "Allow",
+            "Action": "sms-voice:SendTextMessage",
+            "Resource": "arn:aws:sms-voice:us-east-1:123456789012:phone-number/phone-abcdef1234567890abcdef1234567890",
+            "Condition": {
+                "StringEquals": {
+                    "sms-voice:OriginationIdentity": "+15551234567"
+                }
+            }
+        }
+    ]
+}
+```
+
+Replace `YOUR-BUCKET`, the account ID, region, phone number resource ID, and origination identity with your actual values.
+
+**Create the IAM role (AWS CLI):**
+
+```bash
+# Create the role
+aws iam create-role \
+    --role-name BulkSmsSenderLambdaRole \
+    --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "lambda.amazonaws.com"},
+            "Action": "sts:AssumeRole"
+        }]
+    }'
+
+# Attach the basic Lambda execution policy for CloudWatch Logs
+aws iam attach-role-policy \
+    --role-name BulkSmsSenderLambdaRole \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# Create and attach the custom policy (save the JSON above as policy.json)
+aws iam put-role-policy \
+    --role-name BulkSmsSenderLambdaRole \
+    --policy-name BulkSmsSenderPermissions \
+    --policy-document file://policy.json
+```
 
 ### Step 5: Test
 
@@ -190,7 +320,7 @@ The basic setup above sends messages immediately when a file is uploaded. Most p
 
 ### Option 1: Amazon EventBridge Scheduler (Recommended)
 
-**Best for:** Most use cases. Simple, low-cost, native time zone support.
+**Best suited for:** Most use cases. Simple, low-cost, native time zone support.
 
 **How it works:**
 
@@ -199,8 +329,8 @@ Instead of triggering Lambda directly from S3, you decouple the upload from the 
 **Setup:**
 
 1. Upload the CSV to S3 (remove the automatic S3→Lambda trigger, or use a different prefix like `scheduled/`)
-2. Create an EventBridge Scheduler schedule that invokes your Lambda function at the desired date/time, passing the S3 bucket and key as input
-3. At the scheduled time, EventBridge invokes Lambda, which reads the file and sends
+2. Create an Amazon EventBridge Scheduler schedule that invokes your Lambda function at the desired date/time, passing the S3 bucket and key as input
+3. At the scheduled time, Amazon EventBridge Scheduler invokes Lambda, which reads the file and sends
 
 **Creating a schedule (AWS CLI example):**
 
@@ -225,14 +355,14 @@ aws scheduler create-schedule \
 - Schedules auto-delete after execution (configurable)
 
 **Considerations:**
-- Schedule creation is a separate step from file upload (can be automated via API Gateway + Lambda)
+- Schedule creation is a separate step from file upload (can be automated via Amazon API Gateway + Lambda)
 - For a self-service experience, you would build a small frontend or API that accepts the file + desired send time and creates both the S3 object and the schedule
 
 ---
 
 ### Option 2: DynamoDB Scheduling Table
 
-**Best for:** Customers who need to manage many scheduled campaigns with the ability to view, cancel, or reschedule pending sends.
+**Best suited for:** Customers who need to manage many scheduled campaigns with the ability to view, cancel, or reschedule pending sends.
 
 **How it works:**
 
@@ -269,7 +399,7 @@ A DynamoDB table acts as a scheduling ledger. When a CSV is uploaded, a record i
 
 ### Option 3: AWS Step Functions with Wait State
 
-**Best for:** Customers who want scheduling as part of a larger workflow (e.g., approval → schedule → send → report), or who prefer a visual workflow designer.
+**Best suited for:** Customers who want scheduling as part of a larger workflow (e.g., approval → schedule → send → report), or who prefer a visual workflow designer.
 
 **How it works:**
 
@@ -302,13 +432,13 @@ An S3 upload triggers a Step Functions state machine. The state machine reads th
 **Considerations:**
 - Step Functions charges per state transition ($0.025 per 1,000 transitions)
 - Each waiting execution consumes a slot (default limit: 1,000,000 concurrent executions per region, so this is rarely an issue)
-- More complex initial setup compared to EventBridge Scheduler
+- More complex initial setup compared to Amazon EventBridge Scheduler
 
 ---
 
 ## Comparison Summary
 
-| Capability | EventBridge Scheduler | DynamoDB + Poller | Step Functions |
+| Capability | Amazon EventBridge Scheduler | Amazon DynamoDB + Poller | AWS Step Functions |
 |---|---|---|---|
 | Complexity | Low | Medium | Medium-High |
 | Time zone support | Native | Manual (convert in code) | Manual (use UTC) |
@@ -316,7 +446,7 @@ An S3 upload triggers a Step Functions state machine. The state machine reads th
 | Visibility into pending sends | List schedules via API | Query DynamoDB table | View executions in console |
 | Part of larger workflow | No (standalone) | No (standalone) | Yes (add any states) |
 | Cost | Very low | Low | Low-Medium |
-| Best for | Most use cases | Campaign management | Complex workflows |
+| Recommended for | Most use cases | Campaign management | Complex workflows |
 
 ## Throttling and Rate Limits
 
@@ -331,7 +461,7 @@ AWS End User Messaging enforces per-second sending limits (TPS) based on your or
 
 **For small lists (under 1,000 numbers):** A simple delay between API calls in your Lambda function (e.g., 50–100ms) is sufficient to stay within limits.
 
-**For large lists (1,000+ numbers):** Consider using Amazon SQS as a buffer between the CSV reader and the sender. The reader Lambda pushes each phone number as a message to an SQS queue, and a sender Lambda processes the queue at a controlled concurrency using reserved concurrency settings. This gives you natural backpressure and retry handling.
+**For large lists (1,000+ numbers):** Consider using Amazon Simple Queue Service (Amazon SQS) as a buffer between the CSV reader and the sender. The reader Lambda pushes each phone number as a message to an SQS queue, and a sender Lambda processes the queue at a controlled concurrency using reserved concurrency settings. This gives you natural backpressure and retry handling.
 
 ## Error Handling Recommendations
 
@@ -355,11 +485,128 @@ AWS End User Messaging enforces per-second sending limits (TPS) based on your or
 | SMS messages | Per message segment, varies by destination country |
 | Lambda | Per invocation + duration (free tier: 1M requests/month) |
 | S3 | Per GB stored + per request (negligible for CSV files) |
-| EventBridge Scheduler | Free tier covers 14M invocations/month |
+| Amazon EventBridge Scheduler | Free tier covers 14M invocations/month |
 | DynamoDB (if used) | On-demand: per read/write request |
 | Step Functions (if used) | $0.025 per 1,000 state transitions |
 
 The dominant cost will be the SMS messages themselves.
+
+---
+
+## Security Guidelines by AWS Service
+
+This section provides security guidance for each AWS service used in this solution. Implement these controls based on your organization's security requirements.
+
+### Amazon S3
+
+- Enable Block Public Access (all four settings)
+- Enable default encryption at rest (SSE-S3 or SSE-KMS)
+- Enforce HTTPS-only access via bucket policy (`aws:SecureTransport` condition)
+- Enable server access logging or AWS CloudTrail data events for audit
+- Enable versioning to protect against accidental deletes
+- Scope IAM permissions to specific bucket ARN and prefix paths
+- Consider MFA Delete for production buckets
+
+### AWS Lambda
+
+- Use least-privilege execution roles — only the permissions listed in Step 4
+- Encrypt environment variables with AWS KMS (Lambda console → Configuration → Environment variables → Enable helpers for encryption in transit)
+- Set appropriate timeout and memory limits to prevent runaway executions
+- Enable AWS X-Ray tracing for debugging and performance monitoring
+- Use Lambda reserved concurrency to limit parallel executions and control SMS throughput
+- Monitor with Amazon CloudWatch Alarms on error rate and duration
+
+### AWS End User Messaging (Amazon Pinpoint SMS Voice V2)
+
+- Scope `SendTextMessage` to a specific origination identity ARN with a condition key
+- Use a configuration set to track delivery events and enable CloudWatch metrics
+- Monitor spend with SMS spend limits in the AWS End User Messaging console
+- Maintain opt-out compliance — filter opted-out numbers before sending
+- Use `TRANSACTIONAL` message type for time-sensitive messages and `PROMOTIONAL` for marketing
+
+### Amazon EventBridge Scheduler
+
+- Use a dedicated IAM role for the scheduler with only `lambda:InvokeFunction` permission scoped to the target Lambda ARN
+- Enable encryption at rest for schedule payloads using AWS KMS
+- Use `ActionAfterCompletion: DELETE` for one-time schedules to auto-clean
+- Set `FlexibleTimeWindow` to `OFF` for time-sensitive sends
+
+### Amazon DynamoDB (if using scheduling option 2)
+
+- Enable encryption at rest (default SSE or KMS CMK)
+- Enable point-in-time recovery (PITR) for data protection
+- Use IAM condition keys to restrict access to specific table ARNs
+- Enable DynamoDB Streams only if needed; disable otherwise
+- Use on-demand capacity mode unless you have predictable traffic patterns
+
+### AWS Step Functions (if using scheduling option 3)
+
+- Use a dedicated IAM role with only the permissions needed to invoke the target Lambda functions
+- Enable CloudWatch Logs for execution history and debugging
+- Enable AWS X-Ray tracing for end-to-end visibility
+- Use Standard Workflows (not Express) for long-running wait states
+- Review execution history regularly for failed or stuck executions
+
+---
+
+## Data Classification and Handling
+
+This solution processes the following data types:
+
+| Data Element | Classification | Storage Location | Protection |
+|---|---|---|---|
+| Phone numbers (E.164) | PII | S3 (CSV files), CloudWatch Logs | Encryption at rest (S3 SSE), HTTPS in transit |
+| SMS message content | PII / Sensitive | S3 (CSV files), CloudWatch Logs | Encryption at rest (S3 SSE), HTTPS in transit |
+| Send results / Message IDs | Operational | S3 (log files), CloudWatch Logs | Encryption at rest (S3 SSE) |
+| Lambda environment variables | Configuration / Sensitive | Lambda service | KMS encryption |
+
+**Handling procedures:**
+
+- Do not store phone numbers or message content longer than necessary — set S3 lifecycle policies to expire processed files and logs after your retention period
+- Restrict access to the S3 bucket and CloudWatch log group to authorized personnel only
+- Do not log full message content to CloudWatch in production — the current implementation logs phone numbers and message IDs but not message bodies
+- Redact or mask PII in any external reporting or dashboards
+
+---
+
+## Risk Assessment
+
+| Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|
+| Unauthorized access to S3 bucket containing PII | Low | High | Block Public Access, bucket policy, least-privilege IAM, encryption at rest |
+| SMS sent to opted-out recipients | Medium | High | Filter opt-out list before upload, rely on carrier-level STOP handling |
+| Excessive SMS costs from large or repeated uploads | Medium | Medium | Set SMS spend limits, use Lambda reserved concurrency, monitor with CloudWatch Alarms |
+| Lambda timeout on very large CSV files | Low | Medium | Increase timeout, use SQS fan-out for files over 100K rows |
+| Throttling from exceeding TPS limits | Medium | Low | Configure `SEND_DELAY_MS`, use SQS-based architecture for high volume |
+| Accidental deletion of CSV files before processing | Low | Low | Enable S3 versioning, move to processed/ after send |
+| Credential exposure | Low | High | Use IAM roles (no hardcoded credentials), encrypt Lambda env vars with KMS |
+| Data exfiltration via CloudWatch Logs | Low | Medium | Restrict log group access, avoid logging message bodies, set log retention policies |
+
+---
+
+## Threat Model Summary
+
+**System:** CSV Bulk SMS Sender — serverless architecture processing CSV uploads and sending SMS via AWS End User Messaging.
+
+**Trust boundaries:**
+
+1. External → S3: CSV file upload (authenticated via IAM or presigned URL)
+2. S3 → Lambda: Event notification (AWS-managed, trusted)
+3. Lambda → End User Messaging: API call (IAM-authenticated, HTTPS)
+4. Lambda → S3: Read/write operations (IAM-authenticated, HTTPS)
+
+**Threat categories (STRIDE):**
+
+| Threat | Category | Mitigation |
+|---|---|---|
+| Unauthorized CSV upload | Spoofing | IAM policies, S3 bucket policy, presigned URL expiration |
+| Tampered CSV content (malicious phone numbers or injection) | Tampering | E.164 format validation in Lambda, S3 versioning |
+| Excessive sends without audit trail | Repudiation | S3 access logging, CloudWatch Logs, per-send log files in S3 |
+| PII exposure in logs or S3 | Information Disclosure | Encryption at rest/transit, least-privilege access, log retention policies |
+| Flooding the SMS API with oversized CSVs | Denial of Service | Lambda timeout/concurrency limits, `SEND_DELAY_MS` throttle, SQS buffering |
+| Lambda role with excessive permissions | Elevation of Privilege | Least-privilege IAM, scoped resource ARNs, condition keys |
+
+**Residual risks:** The solution relies on AWS-managed encryption and IAM for access control. Organizations with stricter compliance requirements should consider VPC-deployed Lambda, AWS KMS customer managed keys, and AWS CloudTrail for comprehensive audit logging.
 
 ---
 
@@ -369,6 +616,6 @@ The dominant cost will be the SMS messages themselves.
 2. Set up the core components (S3 bucket, Lambda function, IAM role)
 3. Test with a small CSV of numbers you control
 4. Add your chosen scheduling mechanism
-5. Build a simple upload interface if needed (API Gateway + S3 presigned URLs work well for this)
+5. Build a simple upload interface if needed (Amazon API Gateway + S3 presigned URLs work well for this)
 
 For questions about origination identity setup, 10DLC registration, or sending limits, refer to the [AWS End User Messaging documentation](https://docs.aws.amazon.com/sms-voice/latest/userguide/) or contact your AWS account team.
