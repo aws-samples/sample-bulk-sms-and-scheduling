@@ -7,27 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **SAM template** (`template.yaml`) — one-command deployment of S3 bucket, Lambda function, IAM roles, S3 event trigger, and EventBridge Scheduler role
+- **SAM config** (`samconfig.toml`) — repeatable deploy defaults for `sam deploy`
+- **EventBridge Scheduler support** — Lambda handler now accepts direct invocation with `{"bucket", "key"}` payload in addition to S3 event triggers, enabling scheduled sends
+- **EventBridge Scheduler IAM role** — deployed with the stack, scoped to invoke only the bulk SMS Lambda
+- **Test suite** — 8 CSV test files covering all formats (phone-only, unique messages, template variables) and edge cases (invalid numbers, empty files, quoted commas, UTF-8 BOM)
+- **Test runner script** (`tests/run-tests.sh`) — sequential test execution with log checking
+
 ### Fixed
 
-- **E.164 phone number validation** added to Lambda — invalid phone numbers are now rejected before calling the SMS API
-- **S3 event parameter validation** — malformed S3 event records are caught and logged instead of crashing the function
-- **S3 GetObject error handling** — failed CSV downloads now return a structured error instead of an unhandled exception
-
-### Security
-
-- **IAM wildcard removed** — `sms-voice:SendTextMessage` resource scoped to specific origination identity ARN with condition key in both README and setup guide
-- **S3 bucket security hardening** — added Block Public Access, encryption at rest, HTTPS enforcement, versioning, and access logging guidance with CLI commands
-- **Lambda environment variable encryption** — added KMS encryption guidance for sensitive configuration
-- **Data classification table** — documented PII handling procedures for phone numbers and message content
-- **Threat model** — added STRIDE-based threat analysis covering all trust boundaries
-- **Risk assessment** — added consolidated risk/likelihood/impact/mitigation table
-- **Security guidelines per service** — added security guidance for all 6 AWS services (S3, Lambda, End User Messaging, EventBridge Scheduler, DynamoDB, Step Functions)
-- **Actionable IAM policy** — added complete IAM policy JSON and AWS CLI commands for role creation
+- **UTF-8 BOM handling** — CSV parsing now uses `utf-8-sig` codec so files saved from Windows tools (Excel, Notepad) with a BOM prefix are parsed correctly
+- **`move_to_processed` for scheduled files** — files in `scheduled/` prefix are now correctly moved to `processed/` after sending (previously only `incoming/` was handled)
 
 ### Changed
 
-- **AWS service naming** — corrected first mentions to use full service names (Amazon EventBridge Scheduler, Amazon API Gateway, Amazon Simple Queue Service)
-- **Superlative language** — replaced "Best for" with "Best suited for" and "Recommended for" per AWS content guidelines
+- **README rewritten** — now documents SAM deployment, dual-mode sending (immediate via S3 trigger + scheduled via EventBridge Scheduler), and updated architecture diagram
+- **Setup guide updated** — added BOM encoding note and template variable placeholder behavior documentation
+
+### Security
+
+- **PII scrubbed from test files** — all test CSVs use placeholder phone numbers, no real numbers or account IDs in committed files
 
 ## [0.1.0] - 2026-04-09
 
@@ -40,3 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Configurable send throttling** via `SEND_DELAY_MS` environment variable
 - **Configuration set support** for delivery event tracking
 - **Setup guide** with three scheduling options: EventBridge Scheduler, DynamoDB polling, and Step Functions
+- **E.164 phone number validation** — invalid phone numbers are rejected before calling the SMS API
+- **S3 event parameter validation** — malformed S3 event records are caught and logged instead of crashing the function
+- **S3 GetObject error handling** — failed CSV downloads return a structured error instead of an unhandled exception
+
+### Security
+
+- **IAM wildcard removed** — `sms-voice:SendTextMessage` resource scoped to specific origination identity ARN with condition key
+- **S3 bucket security hardening** — Block Public Access, encryption at rest, HTTPS enforcement, versioning, and access logging guidance
+- **Lambda environment variable encryption** — KMS encryption guidance for sensitive configuration
+- **Data classification table** — PII handling procedures for phone numbers and message content
+- **Threat model** — STRIDE-based threat analysis covering all trust boundaries
+- **Risk assessment** — consolidated risk/likelihood/impact/mitigation table
+- **Security guidelines per service** — guidance for S3, Lambda, End User Messaging, EventBridge Scheduler, DynamoDB, Step Functions
+- **Actionable IAM policy** — complete IAM policy JSON and AWS CLI commands for role creation
