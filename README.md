@@ -152,6 +152,7 @@ Set `DEFAULT_MESSAGE` to: `Hi {{name}}, your appointment is on {{appt_date}}.`
 | `MESSAGE_TYPE` | No | `TRANSACTIONAL` (default) or `PROMOTIONAL` |
 | `CONFIGURATION_SET` | No | Configuration set name for event tracking |
 | `SEND_DELAY_MS` | No | Milliseconds between sends (default: `50`) |
+| `MAX_RETRIES` | No | Max retry attempts for throttled sends (default: `3`). Uses exponential backoff (2s, 4s, 8s). |
 
 ## IAM Permissions Required
 

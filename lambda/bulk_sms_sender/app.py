@@ -52,6 +52,7 @@ DEFAULT_MESSAGE = os.environ.get("DEFAULT_MESSAGE", "")
 MESSAGE_TYPE = os.environ.get("MESSAGE_TYPE", "TRANSACTIONAL")
 CONFIGURATION_SET = os.environ.get("CONFIGURATION_SET", "")
 SEND_DELAY_MS = int(os.environ.get("SEND_DELAY_MS", "50"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 
 
 def handler(event, context):
@@ -157,31 +158,46 @@ def process_csv(bucket: str, key: str) -> dict:
 
 
 def send_sms(phone: str, message: str, results: dict) -> bool:
-    """Send a single SMS and update results tracking."""
+    """Send a single SMS with retry and exponential backoff for throttling."""
     row_num = results["total"]
-    try:
-        params = {
-            "DestinationPhoneNumber": phone,
-            "OriginationIdentity": ORIGINATION_IDENTITY,
-            "MessageBody": message,
-            "MessageType": MESSAGE_TYPE,
-        }
-        if CONFIGURATION_SET:
-            params["ConfigurationSetName"] = CONFIGURATION_SET
+    params = {
+        "DestinationPhoneNumber": phone,
+        "OriginationIdentity": ORIGINATION_IDENTITY,
+        "MessageBody": message,
+        "MessageType": MESSAGE_TYPE,
+    }
+    if CONFIGURATION_SET:
+        params["ConfigurationSetName"] = CONFIGURATION_SET
 
-        resp = sms.send_text_message(**params)
-        msg_id = resp.get("MessageId", "unknown")
-        logger.info("Sent to %s — MessageId: %s", phone, msg_id)
-        results["sent"] += 1
-        results["log_lines"].append(f"Row {row_num} | SENT | {phone} | MessageId: {msg_id}")
-        return True
-    except ClientError as e:
-        error_msg = e.response["Error"]["Message"]
-        logger.error("Failed to send to %s: %s", phone, error_msg)
-        results["failed"] += 1
-        results["errors"].append(f"{phone}: {error_msg}")
-        results["log_lines"].append(f"Row {row_num} | FAILED | {phone} | {error_msg}")
-        return False
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = sms.send_text_message(**params)
+            msg_id = resp.get("MessageId", "unknown")
+            if attempt > 1:
+                logger.info("Sent to %s on attempt %d — MessageId: %s", phone, attempt, msg_id)
+            else:
+                logger.info("Sent to %s — MessageId: %s", phone, msg_id)
+            results["sent"] += 1
+            results["log_lines"].append(f"Row {row_num} | SENT | {phone} | MessageId: {msg_id}")
+            return True
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            error_msg = e.response["Error"]["Message"]
+
+            # Retry on throttling errors only
+            if error_code in ("ThrottlingException", "TooManyRequestsException") and attempt < MAX_RETRIES:
+                wait = 2 ** attempt  # 2s, 4s, 8s
+                logger.warning("Throttled sending to %s (attempt %d/%d), retrying in %ds", phone, attempt, MAX_RETRIES, wait)
+                time.sleep(wait)
+                continue
+
+            logger.error("Failed to send to %s: %s", phone, error_msg)
+            results["failed"] += 1
+            results["errors"].append(f"{phone}: {error_msg}")
+            results["log_lines"].append(f"Row {row_num} | FAILED | {phone} | {error_msg}")
+            return False
+
+    return False
 
 
 def write_s3_log(results: dict, bucket: str, key: str):

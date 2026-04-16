@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SAM config** (`samconfig.toml`) — repeatable deploy defaults for `sam deploy`
 - **EventBridge Scheduler support** — Lambda handler now accepts direct invocation with `{"bucket", "key"}` payload in addition to S3 event triggers, enabling scheduled sends
 - **EventBridge Scheduler IAM role** — deployed with the stack, scoped to invoke only the bulk SMS Lambda
+- **Throttle retry with exponential backoff** — throttled `SendTextMessage` calls are retried up to `MAX_RETRIES` times (default 3) with exponential backoff (2s, 4s, 8s) before marking the row as failed
 - **Test suite** — 8 CSV test files covering all formats (phone-only, unique messages, template variables) and edge cases (invalid numbers, empty files, quoted commas, UTF-8 BOM)
 - **Test runner script** (`tests/run-tests.sh`) — sequential test execution with log checking
 

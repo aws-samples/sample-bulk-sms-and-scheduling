@@ -30,6 +30,10 @@ Parameters:
     Type: String
     Description: Milliseconds between sends (default 50)
     Default: '50'
+  MaxRetries:
+    Type: String
+    Description: Max retry attempts for throttled sends (default 3)
+    Default: '3'
 
 Conditions:
   HasBucketName: !Not [!Equals [!Ref BucketName, '']]
@@ -56,6 +60,7 @@ Resources:
           MESSAGE_TYPE: !Ref MessageType
           CONFIGURATION_SET: !Ref ConfigurationSet
           SEND_DELAY_MS: !Ref SendDelayMs
+          MAX_RETRIES: !Ref MaxRetries
 
   BulkSmsSenderFunctionPermission:
     Type: AWS::Lambda::Permission
