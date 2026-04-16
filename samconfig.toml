@@ -4,7 +4,6 @@ version = 0.1
 stack_name = "bulk-sms-sender"
 resolve_s3 = true
 capabilities = "CAPABILITY_IAM"
-region = "us-east-1"
 confirm_changeset = true
 
 [default.build.parameters]

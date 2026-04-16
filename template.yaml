@@ -138,6 +138,8 @@ Resources:
               - !Sub '${BulkSmsBucket.Arn}/scheduled/*'
           - Effect: Allow
             Action: sms-voice:SendTextMessage
+            # Scoped to * for portability. In production, scope to your
+            # origination identity ARN and add a condition key — see README.
             Resource: '*'
 
   SchedulerRole:
