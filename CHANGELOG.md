@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Throttle retry with exponential backoff** — throttled `SendTextMessage` calls are retried up to `MAX_RETRIES` times (default 3) with exponential backoff (2s, 4s, 8s) before marking the row as failed
 - **Test suite** — 8 CSV test files covering all formats (phone-only, unique messages, template variables) and edge cases (invalid numbers, empty files, quoted commas, UTF-8 BOM)
 - **Test runner script** (`tests/run-tests.sh`) — sequential test execution with log checking
+- **Multi-stack support** — `StackPrefix` parameter allows deploying multiple isolated stacks (e.g. marketing vs transactional) in the same account without name collisions
 
 ### Fixed
 

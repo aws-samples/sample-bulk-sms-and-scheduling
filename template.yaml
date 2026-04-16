@@ -3,6 +3,10 @@ Transform: AWS::Serverless-2016-10-31
 Description: CSV Bulk SMS Sender — upload a CSV to S3 and send SMS via AWS End User Messaging
 
 Parameters:
+  StackPrefix:
+    Type: String
+    Description: Prefix for resource names — use different values for multi-stack deploys (e.g. BulkSmsMarketing, BulkSmsTransactional)
+    Default: BulkSmsSender
   BucketName:
     Type: String
     Description: Name for the S3 bucket (must be globally unique)
@@ -50,7 +54,7 @@ Resources:
   BulkSmsSenderFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: BulkSmsSender
+      FunctionName: !Ref StackPrefix
       Handler: app.handler
       CodeUri: lambda/bulk_sms_sender/
       Environment:
@@ -150,7 +154,7 @@ Resources:
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: BulkSmsSchedulerRole
+      RoleName: !Sub '${StackPrefix}SchedulerRole'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:

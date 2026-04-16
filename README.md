@@ -69,11 +69,28 @@ The deploy will prompt for parameters. Key ones:
 
 | Parameter | Default | Description |
 |---|---|---|
+| `StackPrefix` | `BulkSmsSender` | Prefix for resource names — change for multi-stack deploys |
 | `OriginationIdentity` | (none) | Your sending phone number or ARN |
 | `DefaultMessage` | (empty) | Default message body for phone-only CSVs |
 | `MessageType` | `TRANSACTIONAL` | `TRANSACTIONAL` or `PROMOTIONAL` |
 
 After deployment, the stack outputs give you the bucket name, Lambda ARN, scheduler role ARN, and example commands.
+
+### Multiple stacks for different use cases
+
+Deploy the same template multiple times with different stack names and prefixes:
+
+```bash
+# Marketing — toll-free, promotional
+sam deploy --stack-name bulk-sms-marketing \
+    --parameter-overrides "StackPrefix=BulkSmsMarketing OriginationIdentity=+18001234567 MessageType=PROMOTIONAL"
+
+# Transactional — 10DLC, transactional
+sam deploy --stack-name bulk-sms-transactional \
+    --parameter-overrides "StackPrefix=BulkSmsTransactional OriginationIdentity=+15551234567 MessageType=TRANSACTIONAL"
+```
+
+Each stack gets its own S3 bucket, Lambda function, and IAM roles — fully isolated.
 
 ## Two Ways to Send
 
