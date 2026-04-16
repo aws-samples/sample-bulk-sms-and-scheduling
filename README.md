@@ -71,7 +71,7 @@ The deploy will prompt for parameters. Key ones:
 |---|---|---|
 | `StackPrefix` | `BulkSmsSender` | Prefix for resource names — change for multi-stack deploys |
 | `OriginationIdentity` | (none) | Your sending phone number or ARN |
-| `DefaultMessage` | (empty) | Default message body for phone-only CSVs |
+| `DefaultMessage` | (empty) | Message body used when the CSV has no `message` column (Format A). Required for phone-only CSVs. Supports `{{placeholder}}` template variables when the CSV includes matching columns (Format C). Ignored when the CSV has a `message` column. |
 | `MessageType` | `TRANSACTIONAL` | `TRANSACTIONAL` or `PROMOTIONAL` |
 
 After deployment, the stack outputs give you the bucket name, Lambda ARN, scheduler role ARN, and example commands.
