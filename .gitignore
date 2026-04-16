@@ -19,5 +19,8 @@ Thumbs.db
 .env
 .env.local
 secrets.json
+env.json
+scheduler-target.json
+test-send.csv
 documentation/blog-posts/
 Security scan-report.json

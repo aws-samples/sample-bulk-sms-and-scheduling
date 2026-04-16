@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: CSV Bulk SMS Sender — upload a CSV to S3 and send SMS via AWS End User Messaging
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name for the S3 bucket (must be globally unique)
+    Default: ''
+  OriginationIdentity:
+    Type: String
+    Description: Sending phone number or ARN (e.g. +15551234567)
+    Default: ''
+  DefaultMessage:
+    Type: String
+    Description: Default message body when CSV has no message column
+    Default: ''
+  MessageType:
+    Type: String
+    Description: TRANSACTIONAL or PROMOTIONAL
+    Default: TRANSACTIONAL
+    AllowedValues:
+      - TRANSACTIONAL
+      - PROMOTIONAL
+  ConfigurationSet:
+    Type: String
+    Description: Configuration set name for event tracking (optional)
+    Default: ''
+  SendDelayMs:
+    Type: String
+    Description: Milliseconds between sends (default 50)
+    Default: '50'
+
+Conditions:
+  HasBucketName: !Not [!Equals [!Ref BucketName, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    Timeout: 300
+    MemorySize: 256
+
+Resources:
+  BulkSmsSenderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: BulkSmsSender
+      Handler: app.handler
+      CodeUri: lambda/bulk_sms_sender/
+      Environment:
+        Variables:
+          ORIGINATION_IDENTITY: !Ref OriginationIdentity
+          DEFAULT_MESSAGE: !Ref DefaultMessage
+          MESSAGE_TYPE: !Ref MessageType
+          CONFIGURATION_SET: !Ref ConfigurationSet
+          SEND_DELAY_MS: !Ref SendDelayMs
+
+  BulkSmsSenderFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BulkSmsSenderFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  BulkSmsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: BulkSmsSenderFunctionPermission
+    Properties:
+      BucketName: !If [HasBucketName, !Ref BucketName, !Ref 'AWS::NoValue']
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt BulkSmsSenderFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+                  - Name: suffix
+                    Value: .csv
+
+  BulkSmsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BulkSmsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BulkSmsBucket.Arn
+              - !Sub '${BulkSmsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  BulkSmsSenderPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: BulkSmsSenderS3Access
+      Roles:
+        - !Ref BulkSmsSenderFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource:
+              - !Sub '${BulkSmsBucket.Arn}/incoming/*'
+              - !Sub '${BulkSmsBucket.Arn}/scheduled/*'
+          - Effect: Allow
+            Action: s3:PutObject
+            Resource:
+              - !Sub '${BulkSmsBucket.Arn}/processed/*'
+              - !Sub '${BulkSmsBucket.Arn}/logs/*'
+          - Effect: Allow
+            Action: s3:DeleteObject
+            Resource:
+              - !Sub '${BulkSmsBucket.Arn}/incoming/*'
+              - !Sub '${BulkSmsBucket.Arn}/scheduled/*'
+          - Effect: Allow
+            Action: sms-voice:SendTextMessage
+            Resource: '*'
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BulkSmsSchedulerRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeBulkSmsLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt BulkSmsSenderFunction.Arn
+
+Outputs:
+  BucketName:
+    Description: S3 bucket for CSV uploads
+    Value: !Ref BulkSmsBucket
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt BulkSmsSenderFunction.Arn
+  SchedulerRoleArn:
+    Description: IAM role ARN for EventBridge Scheduler to invoke the Lambda
+    Value: !GetAtt SchedulerRole.Arn
+  UploadCommand:
+    Description: Example upload command
+    Value: !Sub 'aws s3 cp your-file.csv s3://${BulkSmsBucket}/incoming/your-file.csv'
+  ScheduleCommand:
+    Description: Example EventBridge Scheduler command
+    Value: !Sub >-
+      aws scheduler create-schedule --name my-campaign
+      --schedule-expression "at(2026-04-20T10:00:00)"
+      --schedule-expression-timezone "America/Los_Angeles"
+      --flexible-time-window Mode=OFF
+      --action-after-completion DELETE
+      --target '{"Arn":"${BulkSmsSenderFunction.Arn}","RoleArn":"${SchedulerRole.Arn}","Input":"{\"bucket\":\"${BulkSmsBucket}\",\"key\":\"scheduled/my-file.csv\"}"}'
+      --region us-west-2

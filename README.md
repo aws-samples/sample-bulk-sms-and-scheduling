@@ -14,10 +14,22 @@ A serverless solution for sending bulk SMS messages from a CSV file using AWS En
 ## Architecture
 
 ```
+                         Immediate Send
 ┌──────────┐     ┌──────────────┐     ┌─────────────────────────┐
 │  CSV      │────▶│  Amazon S3   │────▶│  AWS Lambda             │
 │  Upload   │     │  incoming/   │     │  (bulk_sms_sender)      │
 └──────────┘     └──────────────┘     └────────┬────────────────┘
+                                               │
+                       Scheduled Send          │
+┌──────────┐     ┌──────────────┐              │
+│  CSV      │────▶│  Amazon S3   │              │
+│  Upload   │     │  scheduled/  │              │
+└──────────┘     └──────────────┘              │
+                                               │
+┌──────────────────────┐                       │
+│  EventBridge         │───────────────────────┘
+│  Scheduler (at time) │
+└──────────────────────┘
                                                │
                                     ┌──────────▼──────────────┐
                                     │  AWS End User Messaging  │
@@ -34,16 +46,75 @@ A serverless solution for sending bulk SMS messages from a CSV file using AWS En
 
 - An active AWS account with AWS End User Messaging configured
 - A registered origination identity (10DLC, toll-free, or short code) approved for sending
-- AWS CLI or AWS Console access
+- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) installed
+- AWS CLI configured with credentials
 - Python 3.12 runtime for Lambda
 
-## Quick Start
+## Quick Start (SAM Deployment)
 
-1. Create an S3 bucket with `incoming/`, `processed/`, and `logs/` prefixes
-2. Deploy the Lambda function from `lambda/bulk_sms_sender/app.py`
-3. Configure environment variables (see below)
-4. Set up an S3 event trigger on `incoming/*.csv`
-5. Upload a CSV and watch it send
+The included SAM template (`template.yaml`) deploys everything you need: S3 bucket, Lambda function, IAM roles, S3 event trigger, and an EventBridge Scheduler role for scheduled sends.
+
+```bash
+# Build
+sam build
+
+# Deploy (first time — interactive)
+sam deploy --guided
+
+# Deploy (subsequent — uses saved config)
+sam build && sam deploy
+```
+
+The deploy will prompt for parameters. Key ones:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `OriginationIdentity` | (none) | Your sending phone number or ARN |
+| `DefaultMessage` | (empty) | Default message body for phone-only CSVs |
+| `MessageType` | `TRANSACTIONAL` | `TRANSACTIONAL` or `PROMOTIONAL` |
+
+After deployment, the stack outputs give you the bucket name, Lambda ARN, scheduler role ARN, and example commands.
+
+## Two Ways to Send
+
+The Lambda supports two invocation modes simultaneously:
+
+### Immediate send (S3 trigger)
+
+Upload a CSV to the `incoming/` prefix and it sends immediately:
+
+```bash
+aws s3 cp my-campaign.csv s3://YOUR-BUCKET/incoming/my-campaign.csv
+```
+
+The S3 event trigger fires the Lambda automatically. After processing, the CSV moves to `processed/` and a log file is written to `logs/`.
+
+### Scheduled send (EventBridge Scheduler)
+
+Upload a CSV to the `scheduled/` prefix (no auto-trigger), then create a one-time schedule:
+
+```bash
+# 1. Upload the CSV (won't trigger Lambda — no event on scheduled/ prefix)
+aws s3 cp my-campaign.csv s3://YOUR-BUCKET/scheduled/my-campaign.csv
+
+# 2. Create a schedule to send at a specific date/time
+aws scheduler create-schedule \
+    --name "april-campaign" \
+    --schedule-expression "at(2026-04-20T10:00:00)" \
+    --schedule-expression-timezone "America/Los_Angeles" \
+    --flexible-time-window Mode=OFF \
+    --action-after-completion DELETE \
+    --target '{
+        "Arn": "YOUR-LAMBDA-ARN",
+        "RoleArn": "YOUR-SCHEDULER-ROLE-ARN",
+        "Input": "{\"bucket\":\"YOUR-BUCKET\",\"key\":\"scheduled/my-campaign.csv\"}"
+    }' \
+    --region us-west-2
+```
+
+At the scheduled time, EventBridge Scheduler invokes the Lambda directly with the bucket and key. The schedule auto-deletes after execution.
+
+The stack outputs include a pre-filled `ScheduleCommand` with your actual ARNs and bucket name — just update the date/time and filename.
 
 ## CSV Formats
 
@@ -69,6 +140,8 @@ phone_number,name,appt_date
 +15559876543,Jordan,April 12 at 1:00 PM
 ```
 Set `DEFAULT_MESSAGE` to: `Hi {{name}}, your appointment is on {{appt_date}}.`
+
+**Note:** Placeholders are only replaced when the CSV contains a matching column. If your `DEFAULT_MESSAGE` includes `{{name}}` but the CSV only has a `phone_number` column, the literal text `{{name}}` will appear in the delivered message. Use a plain `DEFAULT_MESSAGE` (no placeholders) when sending the same message to all recipients.
 
 ## Environment Variables
 
@@ -106,11 +179,25 @@ Scope `sms-voice:SendTextMessage` to your specific origination identity ARN. Add
 
 ## Scheduling Options
 
-See the [full documentation](documentation/user-guides/bulk-sms-and-scheduling-setup-guide.md) for detailed scheduling options:
+The SAM template deploys EventBridge Scheduler support out of the box (IAM role included). The other options below require additional infrastructure.
 
-1. **Amazon EventBridge Scheduler** (recommended) — Simple, low-cost, native time zone support
-2. **Amazon DynamoDB Scheduling Table** — Campaign management with cancel/reschedule capability
-3. **AWS Step Functions** — Complex workflows with approval steps and visual designer
+### Option 1: Amazon EventBridge Scheduler (included in template)
+
+Already deployed with the stack. Upload CSVs to `scheduled/`, create a schedule pointing to the file, and it sends at the specified time. See "Scheduled send" above for usage.
+
+Advantages:
+- Native time zone support — schedule in your recipients' local time
+- One-time and recurring schedules (cron or rate-based)
+- Schedules auto-delete after execution (`--action-after-completion DELETE`)
+- Very low cost (free tier covers 14 million invocations/month)
+
+### Option 2: Amazon DynamoDB Scheduling Table
+
+Best for managing many campaigns with cancel/reschedule capability. Requires a DynamoDB table and a poller Lambda. See the [full documentation](documentation/user-guides/bulk-sms-and-scheduling-setup-guide.md) for setup details.
+
+### Option 3: AWS Step Functions
+
+Best for complex workflows with approval steps and visual designer. Requires a Step Functions state machine. See the [full documentation](documentation/user-guides/bulk-sms-and-scheduling-setup-guide.md) for setup details.
 
 ## Security
 

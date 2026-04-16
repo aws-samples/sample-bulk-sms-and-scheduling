@@ -55,9 +55,25 @@ SEND_DELAY_MS = int(os.environ.get("SEND_DELAY_MS", "50"))
 
 
 def handler(event, context):
-    """Main Lambda handler for S3 trigger."""
+    """Main Lambda handler — supports S3 event triggers and direct invocation.
+
+    S3 trigger format:  {"Records": [{"s3": {"bucket": {"name": "..."}, "object": {"key": "..."}}}]}
+    Direct invocation:  {"bucket": "my-bucket", "key": "scheduled/my-file.csv"}
+    """
     logger.info("Event received: %s", json.dumps(event, default=str))
 
+    # Direct invocation (e.g. from EventBridge Scheduler)
+    if "bucket" in event and "key" in event:
+        bucket = event["bucket"]
+        key = event["key"]
+        logger.info("Direct invocation — processing file: s3://%s/%s", bucket, key)
+        results = process_csv(bucket, key)
+        log_summary(results, bucket, key)
+        write_s3_log(results, bucket, key)
+        move_to_processed(bucket, key)
+        return {"statusCode": 200, "body": "Processing complete"}
+
+    # S3 event trigger
     for record in event.get("Records", []):
         try:
             bucket = record["s3"]["bucket"]["name"]
@@ -88,7 +104,7 @@ def process_csv(bucket: str, key: str) -> dict:
         logger.error("Failed to read s3://%s/%s: %s", bucket, key, e)
         return {"total": 0, "sent": 0, "failed": 0, "errors": [f"S3 GetObject failed: {e}"]}
 
-    body = response["Body"].read().decode("utf-8")
+    body = response["Body"].read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(body))
 
     # Detect CSV format by checking for a 'message' column
@@ -200,8 +216,13 @@ def write_s3_log(results: dict, bucket: str, key: str):
 
 
 def move_to_processed(bucket: str, key: str):
-    """Move the CSV from incoming/ to processed/ after processing."""
-    new_key = key.replace("incoming/", "processed/", 1)
+    """Move the CSV from incoming/ or scheduled/ to processed/ after processing."""
+    if key.startswith("incoming/"):
+        new_key = key.replace("incoming/", "processed/", 1)
+    elif key.startswith("scheduled/"):
+        new_key = key.replace("scheduled/", "processed/", 1)
+    else:
+        new_key = "processed/" + os.path.basename(key)
     try:
         s3.copy_object(
             Bucket=bucket,

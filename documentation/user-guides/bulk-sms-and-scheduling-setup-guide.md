@@ -73,8 +73,10 @@ This sends `"Hi Tyler, your appointment is on April 10 at 3:00 PM..."` to the fi
 
 **Formatting requirements:**
 - Phone numbers must be in E.164 format (e.g., `+15551234567`)
-- UTF-8 encoding
+- UTF-8 encoding (files with a UTF-8 BOM are also handled correctly)
 - If message text contains commas, wrap the field in double quotes
+
+**Note:** Placeholders are only replaced when the CSV contains a matching column. If your `DEFAULT_MESSAGE` includes `{{name}}` but the CSV only has a `phone_number` column, the literal text `{{name}}` will appear in the delivered message. Use a plain `DEFAULT_MESSAGE` (no placeholders) when sending the same message to all recipients.
 
 ## Step-by-Step Setup
 
