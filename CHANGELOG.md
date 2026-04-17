@@ -9,19 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **SAM template** (`template.yaml`) — one-command deployment of S3 bucket, Lambda function, IAM roles, S3 event trigger, and EventBridge Scheduler role
-- **SAM config** (`samconfig.toml`) — repeatable deploy defaults for `sam deploy`
-- **EventBridge Scheduler support** — Lambda handler now accepts direct invocation with `{"bucket", "key"}` payload in addition to S3 event triggers, enabling scheduled sends
-- **EventBridge Scheduler IAM role** — deployed with the stack, scoped to invoke only the bulk SMS Lambda
-- **Throttle retry with exponential backoff** — throttled `SendTextMessage` calls are retried up to `MAX_RETRIES` times (default 3) with exponential backoff (2s, 4s, 8s) before marking the row as failed
-- **Test suite** — 8 CSV test files covering all formats (phone-only, unique messages, template variables) and edge cases (invalid numbers, empty files, quoted commas, UTF-8 BOM)
-- **Test runner script** (`tests/run-tests.sh`) — sequential test execution with log checking
-- **Multi-stack support** — `StackPrefix` parameter allows deploying multiple isolated stacks (e.g. marketing vs transactional) in the same account without name collisions
+- **SQS fan-out architecture** — replaced sequential send loop with a Dispatcher/Sender pattern. The Dispatcher Lambda validates the CSV and writes individual send jobs to SQS; the Sender Lambda consumes from the queue with concurrency-controlled throughput. Eliminates `time.sleep()` idle compute costs and scales to millions of messages.
+- **Dead-letter queue (DLQ)** — failed sends that exhaust SQS retries (3 attempts) land in a DLQ with 14-day retention. Optional CloudWatch alarm + SNS email notification when messages hit the DLQ.
+- **CSV pre-flight validation** — full CSV validation before any messages are queued: checks for required `phone_number` header, validates at least one message source exists, and verifies template variables match CSV columns. Fails the entire job upfront with a clear error report.
+- **Tiered template resolution** — messages are resolved in priority order: (1) per-row `message` column in CSV, (2) inline `message_template` in the request payload with `{{variable}}` substitution, (3) `template_id` referencing a stored template in DynamoDB. If no message source is provided, the job fails immediately.
+- **DynamoDB template table** — optional `{StackPrefix}-templates` table for storing reusable SMS templates with `template_id` as the partition key. Templates are validated against CSV columns at dispatch time.
+- **Campaign context** — every send now carries `campaign_name` and a unique `campaign_id` (name + 8-char UUID suffix) in the `Context` parameter, flowing through to CloudWatch and event destinations for analytics and reporting. `campaign_name` is required.
+- **SQS partial batch failure reporting** — the Sender Lambda uses `ReportBatchItemFailures` so only failed messages return to the queue; successful sends in the same batch are not reprocessed.
 
-### Fixed
+### Removed
 
-- **UTF-8 BOM handling** — CSV parsing now uses `utf-8-sig` codec so files saved from Windows tools (Excel, Notepad) with a BOM prefix are parsed correctly
-- **`move_to_processed` for scheduled files** — files in `scheduled/` prefix are now correctly moved to `processed/` after sending (previously only `incoming/` was handled)
+- **`DEFAULT_MESSAGE` environment variable** — removed the silent fallback to a default message. If no message source is configured, the job now fails explicitly to prevent accidental sends with wrong content.
+- **`SEND_DELAY_MS` environment variable** — throttling is now controlled by Sender Lambda reserved concurrency (`SenderConcurrency` parameter) instead of `time.sleep()`.
+
+### Changed
+
+- **SAM template rewritten** — now deploys Dispatcher Lambda, Sender Lambda, SQS send queue, DLQ, DynamoDB template table, CloudWatch alarm, SNS topic, and updated IAM roles. Replaced single-Lambda architecture.
+- **Architecture diagram** — added proper AWS architecture diagram (`documentation/architecture/bulk-sms-and-scheduling-system-architecture.png`), replacing ASCII art in README and setup guide.
+- **README rewritten** — updated for Dispatcher/Sender architecture, tiered templates, campaign context, throughput control, DLQ handling, and new deploy parameters.
+- **Setup guide rewritten** — updated `documentation/user-guides/bulk-sms-and-scheduling-setup-guide.md` for the new architecture with manual setup steps, updated IAM permissions, and new environment variables.
+- **EventBridge Scheduler payload** — now requires `campaign_name` in the invocation payload for scheduled sends.
+- **Sender Lambda throttle handling** — retry with exponential backoff for throttled `SendTextMessage` calls within a single invocation, with SQS-level retry for persistent failures.
 
 ### Changed
 

@@ -1,11 +1,13 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: CSV Bulk SMS Sender — upload a CSV to S3 and send SMS via AWS End User Messaging
+Description: >-
+  CSV Bulk SMS Sender — upload a CSV to S3, validate and dispatch to SQS,
+  then send SMS via AWS End User Messaging with concurrency-controlled workers.
 
 Parameters:
   StackPrefix:
     Type: String
-    Description: Prefix for resource names — use different values for multi-stack deploys (e.g. BulkSmsMarketing, BulkSmsTransactional)
+    Description: Prefix for resource names — use different values for multi-stack deploys
     Default: BulkSmsSender
   BucketName:
     Type: String
@@ -14,10 +16,6 @@ Parameters:
   OriginationIdentity:
     Type: String
     Description: Sending phone number or ARN (e.g. +15551234567)
-    Default: ''
-  DefaultMessage:
-    Type: String
-    Description: Default message body when CSV has no message column
     Default: ''
   MessageType:
     Type: String
@@ -30,53 +28,174 @@ Parameters:
     Type: String
     Description: Configuration set name for event tracking (optional)
     Default: ''
-  SendDelayMs:
-    Type: String
-    Description: Milliseconds between sends (default 50)
-    Default: '50'
+  SenderConcurrency:
+    Type: Number
+    Description: Max concurrent Sender Lambda invocations (controls SMS throughput)
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
   MaxRetries:
     Type: String
-    Description: Max retry attempts for throttled sends (default 3)
-    Default: '3'
+    Description: Max retry attempts for throttled sends within a single invocation
+    Default: '2'
+  DlqAlarmEmail:
+    Type: String
+    Description: Email address for DLQ alarm notifications (optional)
+    Default: ''
 
 Conditions:
   HasBucketName: !Not [!Equals [!Ref BucketName, '']]
+  HasDlqAlarmEmail: !Not [!Equals [!Ref DlqAlarmEmail, '']]
 
 Globals:
   Function:
     Runtime: python3.12
     Architectures:
       - arm64
-    Timeout: 300
     MemorySize: 256
 
 Resources:
-  BulkSmsSenderFunction:
+
+  # -----------------------------------------------------------------------
+  # SQS Queue + Dead Letter Queue
+  # -----------------------------------------------------------------------
+
+  SmsSendQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${StackPrefix}-send-queue'
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400  # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SmsSendDLQ.Arn
+        maxReceiveCount: 3
+
+  SmsSendDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${StackPrefix}-send-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # -----------------------------------------------------------------------
+  # DynamoDB Template Table (optional — only needed for template_id usage)
+  # -----------------------------------------------------------------------
+
+  SmsTemplateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${StackPrefix}-templates'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: template_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: template_id
+          KeyType: HASH
+
+  # -----------------------------------------------------------------------
+  # Dispatcher Lambda — validates CSV, resolves templates, writes to SQS
+  # -----------------------------------------------------------------------
+
+  DispatcherFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Ref StackPrefix
+      FunctionName: !Sub '${StackPrefix}-dispatcher'
       Handler: app.handler
-      CodeUri: lambda/bulk_sms_sender/
+      CodeUri: lambda/dispatcher/
+      Timeout: 300
       Environment:
         Variables:
           ORIGINATION_IDENTITY: !Ref OriginationIdentity
-          DEFAULT_MESSAGE: !Ref DefaultMessage
           MESSAGE_TYPE: !Ref MessageType
           CONFIGURATION_SET: !Ref ConfigurationSet
-          SEND_DELAY_MS: !Ref SendDelayMs
-          MAX_RETRIES: !Ref MaxRetries
+          SQS_QUEUE_URL: !Ref SmsSendQueue
+          TEMPLATE_TABLE_NAME: !Ref SmsTemplateTable
 
-  BulkSmsSenderFunctionPermission:
+  DispatcherFunctionPermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !GetAtt BulkSmsSenderFunction.Arn
+      FunctionName: !GetAtt DispatcherFunction.Arn
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
 
+  DispatcherPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${StackPrefix}-dispatcher-policy'
+      Roles:
+        - !Ref DispatcherFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource:
+              - !Sub '${BulkSmsBucket.Arn}/incoming/*'
+              - !Sub '${BulkSmsBucket.Arn}/scheduled/*'
+          - Effect: Allow
+            Action: s3:PutObject
+            Resource:
+              - !Sub '${BulkSmsBucket.Arn}/processed/*'
+              - !Sub '${BulkSmsBucket.Arn}/logs/*'
+          - Effect: Allow
+            Action: s3:DeleteObject
+            Resource:
+              - !Sub '${BulkSmsBucket.Arn}/incoming/*'
+              - !Sub '${BulkSmsBucket.Arn}/scheduled/*'
+          - Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt SmsSendQueue.Arn
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+            Resource: !GetAtt SmsTemplateTable.Arn
+
+  # -----------------------------------------------------------------------
+  # Sender Lambda — consumes from SQS, sends SMS
+  # -----------------------------------------------------------------------
+
+  SenderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-sender'
+      Handler: app.handler
+      CodeUri: lambda/sms_sender/
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrentExecutions: !Ref SenderConcurrency
+      Environment:
+        Variables:
+          MAX_RETRIES: !Ref MaxRetries
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SmsSendQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  SenderPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${StackPrefix}-sender-policy'
+      Roles:
+        - !Ref SenderFunctionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sms-voice:SendTextMessage
+            Resource: '*'
+
+  # -----------------------------------------------------------------------
+  # S3 Bucket
+  # -----------------------------------------------------------------------
+
   BulkSmsBucket:
     Type: AWS::S3::Bucket
-    DependsOn: BulkSmsSenderFunctionPermission
+    DependsOn: DispatcherFunctionPermission
     Properties:
       BucketName: !If [HasBucketName, !Ref BucketName, !Ref 'AWS::NoValue']
       BucketEncryption:
@@ -94,7 +213,7 @@ Resources:
       NotificationConfiguration:
         LambdaConfigurations:
           - Event: s3:ObjectCreated:*
-            Function: !GetAtt BulkSmsSenderFunction.Arn
+            Function: !GetAtt DispatcherFunction.Arn
             Filter:
               S3Key:
                 Rules:
@@ -121,40 +240,46 @@ Resources:
               Bool:
                 aws:SecureTransport: 'false'
 
-  BulkSmsSenderPolicy:
-    Type: AWS::IAM::Policy
+  # -----------------------------------------------------------------------
+  # DLQ Alarm + SNS Topic
+  # -----------------------------------------------------------------------
+
+  DlqAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasDlqAlarmEmail
     Properties:
-      PolicyName: BulkSmsSenderS3Access
-      Roles:
-        - !Ref BulkSmsSenderFunctionRole
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Action: s3:GetObject
-            Resource:
-              - !Sub '${BulkSmsBucket.Arn}/incoming/*'
-              - !Sub '${BulkSmsBucket.Arn}/scheduled/*'
-          - Effect: Allow
-            Action: s3:PutObject
-            Resource:
-              - !Sub '${BulkSmsBucket.Arn}/processed/*'
-              - !Sub '${BulkSmsBucket.Arn}/logs/*'
-          - Effect: Allow
-            Action: s3:DeleteObject
-            Resource:
-              - !Sub '${BulkSmsBucket.Arn}/incoming/*'
-              - !Sub '${BulkSmsBucket.Arn}/scheduled/*'
-          - Effect: Allow
-            Action: sms-voice:SendTextMessage
-            # Scoped to * for portability. In production, scope to your
-            # origination identity ARN and add a condition key — see README.
-            Resource: '*'
+      TopicName: !Sub '${StackPrefix}-dlq-alarm'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref DlqAlarmEmail
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDlqAlarmEmail
+    Properties:
+      AlarmName: !Sub '${StackPrefix}-dlq-messages'
+      AlarmDescription: Messages are landing in the SMS send dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SmsSendDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref DlqAlarmTopic
+
+  # -----------------------------------------------------------------------
+  # EventBridge Scheduler Role
+  # -----------------------------------------------------------------------
 
   SchedulerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${StackPrefix}SchedulerRole'
+      RoleName: !Sub '${StackPrefix}-scheduler-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -163,23 +288,35 @@ Resources:
               Service: scheduler.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: InvokeBulkSmsLambda
+        - PolicyName: InvokeDispatcherLambda
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !GetAtt BulkSmsSenderFunction.Arn
+                Resource: !GetAtt DispatcherFunction.Arn
 
 Outputs:
   BucketName:
     Description: S3 bucket for CSV uploads
     Value: !Ref BulkSmsBucket
-  FunctionArn:
-    Description: Lambda function ARN
-    Value: !GetAtt BulkSmsSenderFunction.Arn
+  DispatcherFunctionArn:
+    Description: Dispatcher Lambda function ARN
+    Value: !GetAtt DispatcherFunction.Arn
+  SenderFunctionArn:
+    Description: Sender Lambda function ARN
+    Value: !GetAtt SenderFunction.Arn
+  SendQueueUrl:
+    Description: SQS queue URL for send jobs
+    Value: !Ref SmsSendQueue
+  DlqUrl:
+    Description: Dead-letter queue URL for failed sends
+    Value: !Ref SmsSendDLQ
+  TemplateTableName:
+    Description: DynamoDB table for SMS templates
+    Value: !Ref SmsTemplateTable
   SchedulerRoleArn:
-    Description: IAM role ARN for EventBridge Scheduler to invoke the Lambda
+    Description: IAM role ARN for EventBridge Scheduler
     Value: !GetAtt SchedulerRole.Arn
   UploadCommand:
     Description: Example upload command
@@ -192,5 +329,5 @@ Outputs:
       --schedule-expression-timezone "America/Los_Angeles"
       --flexible-time-window Mode=OFF
       --action-after-completion DELETE
-      --target '{"Arn":"${BulkSmsSenderFunction.Arn}","RoleArn":"${SchedulerRole.Arn}","Input":"{\"bucket\":\"${BulkSmsBucket}\",\"key\":\"scheduled/my-file.csv\"}"}'
+      --target '{"Arn":"${DispatcherFunction.Arn}","RoleArn":"${SchedulerRole.Arn}","Input":"{\"bucket\":\"${BulkSmsBucket}\",\"key\":\"scheduled/my-file.csv\",\"campaign_name\":\"my-campaign\"}"}'
       --region us-west-2

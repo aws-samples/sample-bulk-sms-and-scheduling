@@ -1,46 +1,22 @@
 # CSV Bulk SMS Sender and Scheduler
 
-A serverless solution for sending bulk SMS messages from a CSV file using AWS End User Messaging. Upload a CSV of phone numbers and messages to Amazon S3, and AWS Lambda automatically sends SMS to each recipient. Includes multiple scheduling options for timed sends.
+A serverless solution for sending bulk SMS messages from a CSV file using AWS End User Messaging. Upload a CSV of phone numbers and messages to Amazon S3, and the system automatically validates, dispatches to SQS, and sends SMS to each recipient with concurrency-controlled throughput. Includes scheduling support via EventBridge Scheduler.
 
 ## Features
 
 - **CSV-driven sending** — Upload a CSV and SMS messages are sent automatically
-- **Flexible CSV formats** — Same message to all, unique per recipient, or template variables with `{{placeholder}}` support
-- **Scheduling options** — Immediate send, EventBridge Scheduler, DynamoDB polling, or Step Functions workflows
-- **Automatic logging** — Per-row send results written to S3 as plain-text log files
+- **Pre-flight CSV validation** — Headers, phone formats, and message sources are validated before any sends
+- **Tiered template resolution** — Per-row messages, inline templates with `{{variables}}`, or stored DynamoDB templates
+- **Campaign tracking** — Every send carries a `campaign_name` and unique `campaign_id` for analytics
+- **SQS fan-out architecture** — Dispatcher validates and queues; Sender processes with concurrency control
+- **Dead-letter queue** — Failed sends land in a DLQ with optional CloudWatch alarm notifications
+- **Scheduling options** — Immediate send via S3 trigger or scheduled via EventBridge Scheduler
+- **Automatic logging** — Dispatch results written to S3 as plain-text log files
 - **File lifecycle management** — Processed CSVs are moved from `incoming/` to `processed/` automatically
-- **Throttle control** — Configurable delay between sends to respect TPS limits
 
 ## Architecture
 
-```
-                         Immediate Send
-┌──────────┐     ┌──────────────┐     ┌─────────────────────────┐
-│  CSV      │────▶│  Amazon S3   │────▶│  AWS Lambda             │
-│  Upload   │     │  incoming/   │     │  (bulk_sms_sender)      │
-└──────────┘     └──────────────┘     └────────┬────────────────┘
-                                               │
-                       Scheduled Send          │
-┌──────────┐     ┌──────────────┐              │
-│  CSV      │────▶│  Amazon S3   │              │
-│  Upload   │     │  scheduled/  │              │
-└──────────┘     └──────────────┘              │
-                                               │
-┌──────────────────────┐                       │
-│  EventBridge         │───────────────────────┘
-│  Scheduler (at time) │
-└──────────────────────┘
-                                               │
-                                    ┌──────────▼──────────────┐
-                                    │  AWS End User Messaging  │
-                                    │  (PinpointSMSVoiceV2)    │
-                                    └──────────┬──────────────┘
-                                               │
-                                    ┌──────────▼──────────────┐
-                                    │  SMS delivered to        │
-                                    │  recipients              │
-                                    └─────────────────────────┘
-```
+![Bulk SMS System Architecture](documentation/architecture/bulk-sms-and-scheduling-system-architecture.png)
 
 ## Prerequisites
 
@@ -52,7 +28,7 @@ A serverless solution for sending bulk SMS messages from a CSV file using AWS En
 
 ## Quick Start (SAM Deployment)
 
-The included SAM template (`template.yaml`) deploys everything you need: S3 bucket, Lambda function, IAM roles, S3 event trigger, and an EventBridge Scheduler role for scheduled sends.
+The SAM template deploys everything: S3 bucket, Dispatcher Lambda, Sender Lambda, SQS queue, DLQ, DynamoDB template table, IAM roles, S3 event trigger, and EventBridge Scheduler role.
 
 ```bash
 # Build
@@ -65,56 +41,49 @@ sam deploy --guided
 sam build && sam deploy
 ```
 
-The deploy will prompt for parameters. Key ones:
+Key parameters:
 
 | Parameter | Default | Description |
 |---|---|---|
 | `StackPrefix` | `BulkSmsSender` | Prefix for resource names — change for multi-stack deploys |
 | `OriginationIdentity` | (none) | Your sending phone number or ARN |
-| `DefaultMessage` | (empty) | Message body used when the CSV has no `message` column (Format A). Required for phone-only CSVs. Supports `{{placeholder}}` template variables when the CSV includes matching columns (Format C). Ignored when the CSV has a `message` column. |
 | `MessageType` | `TRANSACTIONAL` | `TRANSACTIONAL` or `PROMOTIONAL` |
-
-After deployment, the stack outputs give you the bucket name, Lambda ARN, scheduler role ARN, and example commands.
+| `SenderConcurrency` | `20` | Max concurrent Sender Lambda invocations (controls SMS throughput) |
+| `DlqAlarmEmail` | (none) | Email for DLQ alarm notifications (optional) |
 
 ### Multiple stacks for different use cases
 
-Deploy the same template multiple times with different stack names and prefixes:
-
 ```bash
-# Marketing — toll-free, promotional
+# Marketing — toll-free, promotional, lower throughput
 sam deploy --stack-name bulk-sms-marketing \
-    --parameter-overrides "StackPrefix=BulkSmsMarketing OriginationIdentity=+18001234567 MessageType=PROMOTIONAL"
+    --parameter-overrides "StackPrefix=BulkSmsMarketing OriginationIdentity=+18001234567 MessageType=PROMOTIONAL SenderConcurrency=10"
 
-# Transactional — 10DLC, transactional
+# Transactional — 10DLC, transactional, higher throughput
 sam deploy --stack-name bulk-sms-transactional \
-    --parameter-overrides "StackPrefix=BulkSmsTransactional OriginationIdentity=+15551234567 MessageType=TRANSACTIONAL"
+    --parameter-overrides "StackPrefix=BulkSmsTransactional OriginationIdentity=+15551234567 MessageType=TRANSACTIONAL SenderConcurrency=50"
 ```
-
-Each stack gets its own S3 bucket, Lambda function, and IAM roles — fully isolated.
 
 ## Two Ways to Send
 
-The Lambda supports two invocation modes simultaneously:
-
 ### Immediate send (S3 trigger)
 
-Upload a CSV to the `incoming/` prefix and it sends immediately:
+Upload a CSV to the `incoming/` prefix and it processes immediately:
 
 ```bash
 aws s3 cp my-campaign.csv s3://YOUR-BUCKET/incoming/my-campaign.csv
 ```
 
-The S3 event trigger fires the Lambda automatically. After processing, the CSV moves to `processed/` and a log file is written to `logs/`.
+When triggered by S3, the `campaign_name` is derived from the filename (e.g. `my-campaign`).
 
 ### Scheduled send (EventBridge Scheduler)
 
-Upload a CSV to the `scheduled/` prefix (no auto-trigger), then create a one-time schedule:
+Upload a CSV to `scheduled/` (no auto-trigger), then create a one-time schedule:
 
 ```bash
-# 1. Upload the CSV (won't trigger Lambda — no event on scheduled/ prefix)
+# 1. Upload the CSV
 aws s3 cp my-campaign.csv s3://YOUR-BUCKET/scheduled/my-campaign.csv
 
-# 2. Create a schedule to send at a specific date/time
+# 2. Create a schedule
 aws scheduler create-schedule \
     --name "april-campaign" \
     --schedule-expression "at(2026-04-20T10:00:00)" \
@@ -122,78 +91,149 @@ aws scheduler create-schedule \
     --flexible-time-window Mode=OFF \
     --action-after-completion DELETE \
     --target '{
-        "Arn": "YOUR-LAMBDA-ARN",
+        "Arn": "YOUR-DISPATCHER-ARN",
         "RoleArn": "YOUR-SCHEDULER-ROLE-ARN",
-        "Input": "{\"bucket\":\"YOUR-BUCKET\",\"key\":\"scheduled/my-campaign.csv\"}"
+        "Input": "{\"bucket\":\"YOUR-BUCKET\",\"key\":\"scheduled/my-campaign.csv\",\"campaign_name\":\"april-campaign\"}"
     }' \
     --region us-west-2
 ```
 
-At the scheduled time, EventBridge Scheduler invokes the Lambda directly with the bucket and key. The schedule auto-deletes after execution.
+For direct invocation, `campaign_name` is required in the payload.
 
-The stack outputs include a pre-filled `ScheduleCommand` with your actual ARNs and bucket name — just update the date/time and filename.
+## Message Templates
 
-## CSV Formats
+Messages are resolved in priority order. The first match wins:
 
-### Same message to all recipients
-```csv
-phone_number
-+15551234567
-+15559876543
-```
-Set the `DEFAULT_MESSAGE` environment variable with your message body.
+### Priority 1: Per-row `message` column in CSV
 
-### Unique message per recipient
+Each row has its own fully-written message. No variable substitution.
+
 ```csv
 phone_number,message
 +15551234567,Your appointment is confirmed for April 8.
 +15559876543,Your order #4821 has shipped.
 ```
 
-### Template variables
+### Priority 2: Inline `message_template` in the request
+
+Pass a template with `{{variable}}` placeholders in the invocation payload. CSV columns provide the values.
+
+```json
+{
+    "bucket": "my-bucket",
+    "key": "scheduled/appointments.csv",
+    "campaign_name": "april-reminders",
+    "message_template": "Hi {{name}}, your appointment is on {{appt_date}}."
+}
+```
+
 ```csv
 phone_number,name,appt_date
 +15551234567,Tyler,April 10 at 3:00 PM
 +15559876543,Jordan,April 12 at 1:00 PM
 ```
-Set `DEFAULT_MESSAGE` to: `Hi {{name}}, your appointment is on {{appt_date}}.`
 
-**Note:** Placeholders are only replaced when the CSV contains a matching column. If your `DEFAULT_MESSAGE` includes `{{name}}` but the CSV only has a `phone_number` column, the literal text `{{name}}` will appear in the delivered message. Use a plain `DEFAULT_MESSAGE` (no placeholders) when sending the same message to all recipients.
+### Priority 3: Stored DynamoDB template
 
-## Environment Variables
-
-| Variable | Required | Description |
-|---|---|---|
-| `ORIGINATION_IDENTITY` | Yes | Sending phone number or ARN |
-| `DEFAULT_MESSAGE` | Conditional | Default message body (required when CSV has no `message` column) |
-| `MESSAGE_TYPE` | No | `TRANSACTIONAL` (default) or `PROMOTIONAL` |
-| `CONFIGURATION_SET` | No | Configuration set name for event tracking |
-| `SEND_DELAY_MS` | No | Milliseconds between sends (default: `50`) |
-| `MAX_RETRIES` | No | Max retry attempts for throttled sends (default: `3`). Uses exponential backoff (2s, 4s, 8s). |
-
-## IAM Permissions Required
-
-| Permission | Resource | Purpose |
-|---|---|---|
-| `s3:GetObject` | `arn:aws:s3:::YOUR-BUCKET/incoming/*` | Read uploaded CSV |
-| `s3:PutObject` | `arn:aws:s3:::YOUR-BUCKET/processed/*`, `arn:aws:s3:::YOUR-BUCKET/logs/*` | Move files, write logs |
-| `s3:DeleteObject` | `arn:aws:s3:::YOUR-BUCKET/incoming/*` | Remove from incoming after move |
-| `sms-voice:SendTextMessage` | `arn:aws:us-east-1:123456789012:phone-number/phone-abcdef1234567890abcdef1234567890` | Send SMS via a specific origination identity |
-
-Scope `sms-voice:SendTextMessage` to your specific origination identity ARN. Add a condition key to further restrict by origination identity:
+Reference a template stored in the DynamoDB template table:
 
 ```json
 {
-    "Effect": "Allow",
-    "Action": "sms-voice:SendTextMessage",
-    "Resource": "arn:aws:sms-voice:us-east-1:123456789012:phone-number/phone-abcdef1234567890abcdef1234567890",
-    "Condition": {
-        "StringEquals": {
-            "sms-voice:OriginationIdentity": "+15551234567"
-        }
-    }
+    "bucket": "my-bucket",
+    "key": "scheduled/appointments.csv",
+    "campaign_name": "april-reminders",
+    "template_id": "appointment-reminder-v1"
 }
 ```
+
+Create a template:
+
+```bash
+aws dynamodb put-item \
+    --table-name BulkSmsSender-templates \
+    --item '{
+        "template_id": {"S": "appointment-reminder-v1"},
+        "template_body": {"S": "Hi {{name}}, your appointment is on {{appt_date}}."},
+        "description": {"S": "Standard appointment reminder"},
+        "required_variables": {"SS": ["name", "appt_date"]},
+        "created_at": {"S": "2026-04-17T00:00:00Z"}
+    }'
+```
+
+### No message = failure
+
+If none of the three message sources are provided, the job fails immediately with a clear error. There is no silent default fallback — this prevents accidental sends with wrong content.
+
+## Campaign Context
+
+Every send includes campaign metadata for analytics:
+
+- `campaign_name` — human-readable name (required in payload, or derived from filename for S3 triggers)
+- `campaign_id` — `{campaign_name}-{8-char-uuid}` generated per job execution
+
+These are passed as the `Context` parameter on `send-text-message`, flowing through to CloudWatch and event destinations. Use them to filter delivery rates, failures, and costs per campaign.
+
+## CSV Validation
+
+Before any messages are queued, the Dispatcher validates:
+
+- CSV has headers (not empty)
+- `phone_number` column exists
+- At least one message source is configured (per-row column, inline template, or template_id)
+- If using a template, all `{{placeholder}}` variables have matching CSV columns
+- Per-row: phone numbers match E.164 format, messages are not empty
+
+If validation fails, the entire job is rejected with a detailed error log written to `logs/`.
+
+## Throughput Control
+
+SMS throughput is controlled by the `SenderConcurrency` parameter — the reserved concurrency on the Sender Lambda. Each Sender invocation processes up to 10 messages from SQS.
+
+| SenderConcurrency | Approx. throughput | Use case |
+|---|---|---|
+| 5 | ~25 msg/sec | Low-volume, conservative |
+| 20 | ~100 msg/sec | Standard workloads |
+| 50 | ~250 msg/sec | High-volume campaigns |
+
+Adjust based on your account's SMS rate limits. No code changes needed — just update the parameter and redeploy.
+
+## Failed Message Handling
+
+Messages that fail after 3 SQS delivery attempts land in the dead-letter queue (DLQ). If you provided a `DlqAlarmEmail` parameter, a CloudWatch alarm triggers an SNS notification when messages appear in the DLQ.
+
+To inspect failed messages:
+
+```bash
+# Check DLQ depth
+aws sqs get-queue-attributes \
+    --queue-url YOUR-DLQ-URL \
+    --attribute-names ApproximateNumberOfMessages
+
+# Receive and inspect failed messages
+aws sqs receive-message \
+    --queue-url YOUR-DLQ-URL \
+    --max-number-of-messages 10
+```
+
+## IAM Permissions
+
+### Dispatcher Lambda
+
+| Permission | Resource | Purpose |
+|---|---|---|
+| `s3:GetObject` | `incoming/*`, `scheduled/*` | Read uploaded CSV |
+| `s3:PutObject` | `processed/*`, `logs/*` | Move files, write logs |
+| `s3:DeleteObject` | `incoming/*`, `scheduled/*` | Remove from source after move |
+| `sqs:SendMessage` | Send Queue ARN | Write send jobs to SQS |
+| `dynamodb:GetItem` | Template Table ARN | Fetch stored templates |
+
+### Sender Lambda
+
+| Permission | Resource | Purpose |
+|---|---|---|
+| `sms-voice:SendTextMessage` | `*` | Send SMS via End User Messaging |
+
+In production, scope `sms-voice:SendTextMessage` to your specific origination identity ARN with a condition key.
 
 ## Scheduling Options
 
@@ -202,12 +242,6 @@ The SAM template deploys EventBridge Scheduler support out of the box (IAM role 
 ### Option 1: Amazon EventBridge Scheduler (included in template)
 
 Already deployed with the stack. Upload CSVs to `scheduled/`, create a schedule pointing to the file, and it sends at the specified time. See "Scheduled send" above for usage.
-
-Advantages:
-- Native time zone support — schedule in your recipients' local time
-- One-time and recurring schedules (cron or rate-based)
-- Schedules auto-delete after execution (`--action-after-completion DELETE`)
-- Very low cost (free tier covers 14 million invocations/month)
 
 ### Option 2: Amazon DynamoDB Scheduling Table
 
@@ -221,27 +255,24 @@ Best for complex workflows with approval steps and visual designer. Requires a S
 
 ### S3 Bucket Security
 
-- Enable Block Public Access on the S3 bucket
-- Enable default encryption (SSE-S3 or SSE-KMS) for encryption at rest
-- Add a bucket policy to enforce HTTPS-only access (deny `aws:SecureTransport = false`)
-- Enable S3 server access logging or AWS CloudTrail data events
-- Enable versioning to protect against accidental deletes
-- Consider enabling MFA Delete for production buckets
+- Block Public Access enabled on the S3 bucket
+- Default encryption (SSE-KMS) for encryption at rest
+- Bucket policy enforces HTTPS-only access
+- Versioning enabled to protect against accidental deletes
 
 ### IAM and Access Control
 
-- Scope all S3 permissions to the specific bucket ARN
-- Scope `sms-voice:SendTextMessage` to your origination identity ARN with a condition key (see IAM section above)
-- Use least-privilege IAM roles — grant only the permissions listed in the IAM table
-- Review IAM policies periodically and remove unused permissions
+- All S3 permissions scoped to specific bucket ARN and prefixes
+- SQS permissions scoped to the specific queue ARN
+- DynamoDB permissions scoped to the template table ARN
+- Sender Lambda has reserved concurrency to prevent runaway invocations
 
 ### Data Protection
 
 - Phone numbers and message content are PII — treat them accordingly
-- Enable encryption at rest on S3 (SSE-S3 or SSE-KMS) and Lambda environment variables (KMS)
+- Encryption at rest on S3 (SSE-KMS), SQS (SSE-SQS), and DynamoDB
 - All AWS SDK calls use HTTPS (TLS) by default for encryption in transit
-- Enforce HTTPS-only access to S3 via bucket policy
-- Consider using AWS KMS customer managed keys for sensitive workloads and rotate keys annually
+- SQS messages are retained for 1 day (send queue) or 14 days (DLQ)
 
 ### Opt-Out Compliance
 
