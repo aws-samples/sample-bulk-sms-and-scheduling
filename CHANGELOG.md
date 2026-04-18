@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **KMS encryption for SQS queues** — both the send queue and DLQ are now encrypted at rest with a dedicated KMS key (`StackKmsKey`). Lambda roles updated with `kms:Decrypt` and `kms:GenerateDataKey` permissions.
+- **KMS encryption for SNS topic** — the DLQ alarm SNS topic is now encrypted with the same KMS key.
+- **KMS encryption for DynamoDB** — the SMS template table now uses SSE with a customer-managed KMS key instead of the default AWS-owned key.
+- **DynamoDB point-in-time recovery** — enabled PITR on the template table for backup and restore capability.
+- **S3 access logging** — added a dedicated access logs bucket with a 90-day lifecycle policy. The main bulk SMS bucket now logs all access to this bucket.
+
+### Fixed
+
+- **Unit tests updated** — rewrote `test_send_sms_retry.py` to match the current `send_sms(job)` function signature. Added a new `test_handler_reports_batch_item_failure` test for SQS partial batch failure reporting. All 6 tests passing.
+
 ### Added
 
 - **SQS fan-out architecture** — replaced sequential send loop with a Dispatcher/Sender pattern. The Dispatcher Lambda validates the CSV and writes individual send jobs to SQS; the Sender Lambda consumes from the queue with concurrency-controlled throughput. Eliminates `time.sleep()` idle compute costs and scales to millions of messages.

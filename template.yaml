@@ -57,6 +57,55 @@ Globals:
 Resources:
 
   # -----------------------------------------------------------------------
+  # KMS Key for encrypting SQS, SNS, DynamoDB, and S3
+  # -----------------------------------------------------------------------
+
+  StackKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${StackPrefix} encryption key for SQS, SNS, DynamoDB'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSNSPublish
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: AllowSQSUsage
+            Effect: Allow
+            Principal:
+              Service: sqs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+
+  StackKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${StackPrefix}-key'
+      TargetKeyId: !Ref StackKmsKey
+
+  # -----------------------------------------------------------------------
   # SQS Queue + Dead Letter Queue
   # -----------------------------------------------------------------------
 
@@ -66,6 +115,7 @@ Resources:
       QueueName: !Sub '${StackPrefix}-send-queue'
       VisibilityTimeout: 60
       MessageRetentionPeriod: 86400  # 1 day
+      KmsMasterKeyId: !Ref StackKmsKey
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt SmsSendDLQ.Arn
         maxReceiveCount: 3
@@ -75,6 +125,7 @@ Resources:
     Properties:
       QueueName: !Sub '${StackPrefix}-send-dlq'
       MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref StackKmsKey
 
   # -----------------------------------------------------------------------
   # DynamoDB Template Table (optional — only needed for template_id usage)
@@ -91,6 +142,12 @@ Resources:
       KeySchema:
         - AttributeName: template_id
           KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref StackKmsKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
 
   # -----------------------------------------------------------------------
   # Dispatcher Lambda — validates CSV, resolves templates, writes to SQS
@@ -150,6 +207,11 @@ Resources:
             Action:
               - dynamodb:GetItem
             Resource: !GetAtt SmsTemplateTable.Arn
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt StackKmsKey.Arn
 
   # -----------------------------------------------------------------------
   # Sender Lambda — consumes from SQS, sends SMS
@@ -188,6 +250,62 @@ Resources:
           - Effect: Allow
             Action: sms-voice:SendTextMessage
             Resource: '*'
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt StackKmsKey.Arn
+
+  # -----------------------------------------------------------------------
+  # S3 Access Logging Bucket
+  # -----------------------------------------------------------------------
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt BulkSmsBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   # -----------------------------------------------------------------------
   # S3 Bucket
@@ -210,6 +328,9 @@ Resources:
         RestrictPublicBuckets: true
       VersioningConfiguration:
         Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: bulk-sms-bucket/
       NotificationConfiguration:
         LambdaConfigurations:
           - Event: s3:ObjectCreated:*
@@ -249,6 +370,7 @@ Resources:
     Condition: HasDlqAlarmEmail
     Properties:
       TopicName: !Sub '${StackPrefix}-dlq-alarm'
+      KmsMasterKeyId: !Ref StackKmsKey
       Subscription:
         - Protocol: email
           Endpoint: !Ref DlqAlarmEmail
@@ -300,6 +422,12 @@ Outputs:
   BucketName:
     Description: S3 bucket for CSV uploads
     Value: !Ref BulkSmsBucket
+  AccessLogsBucketName:
+    Description: S3 bucket for access logs
+    Value: !Ref AccessLogsBucket
+  KmsKeyArn:
+    Description: KMS key ARN used for encryption
+    Value: !GetAtt StackKmsKey.Arn
   DispatcherFunctionArn:
     Description: Dispatcher Lambda function ARN
     Value: !GetAtt DispatcherFunction.Arn
